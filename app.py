@@ -1,4 +1,6 @@
+import contextlib
 import os
+import pathlib
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -9,7 +11,6 @@ import feedparser
 import pandas as pd
 import requests
 import streamlit as st
-
 
 # =========================================================
 # 基本設定
@@ -28,7 +29,8 @@ USER_AGENT = (
     "Chrome/122.0 Safari/537.36"
 )
 
-HISTORY_FILE = "news_history.csv"
+# 修正①：履歴ファイルのパスをスクリプトと同じディレクトリに固定
+HISTORY_FILE = pathlib.Path(__file__).parent / "news_history.csv"
 
 
 # =========================================================
@@ -130,6 +132,8 @@ TERM_MAP = {
     r"\bjobs?\b": "雇用",
 }
 
+# 注意：\b（単語境界）は英語テキストのみに有効。日本語部分には効かないが、
+# TERM_MAP は英語見出しの和訳用なので動作上の問題はない。
 def simple_ja(text: str) -> str:
     out = text
     for pattern, repl in sorted(TERM_MAP.items(), key=lambda x: len(x[0]), reverse=True):
@@ -143,18 +147,13 @@ def simple_ja(text: str) -> str:
 def is_japanese(text: str) -> bool:
     return bool(re.search(r"[ぁ-んァ-ン一-龥]", text))
 
+# 修正②：contextlib.suppress で冗長なtry/exceptを整理
 def published_dt(entry):
-    candidates = [
-        getattr(entry, "published_parsed", None),
-        getattr(entry, "updated_parsed", None),
-        getattr(entry, "created_parsed", None),
-    ]
-    for pp in candidates:
+    for attr in ("published_parsed", "updated_parsed", "created_parsed"):
+        pp = getattr(entry, attr, None)
         if pp:
-            try:
+            with contextlib.suppress(Exception):
                 return datetime(*pp[:6], tzinfo=timezone.utc).astimezone(JST)
-            except Exception:
-                pass
     return None
 
 def normalize_text(text: str) -> str:
@@ -190,7 +189,6 @@ def tokenize_mix(text: str):
     text = normalize_text(text)
     en = re.findall(r"[a-z]{3,}", text)
     ja = re.findall(r"[ぁ-んァ-ン一-龥]{2,}", text)
-
     en = [w for w in en if w not in STOP_EN]
     ja = [w for w in ja if w not in STOP_JA]
     return en + ja
@@ -202,12 +200,10 @@ def tokenize_mix(text: str):
 def title_similarity(a: str, b: str) -> float:
     a1 = simple_ja(a)
     b1 = simple_ja(b)
-
     sa = set(tokenize_mix(a1))
     sb = set(tokenize_mix(b1))
     jaccard = len(sa & sb) / max(1, len(sa | sb))
     seq = SequenceMatcher(None, normalize_text(a1), normalize_text(b1)).ratio()
-
     return max(jaccard, seq * 0.7)
 
 
@@ -317,48 +313,57 @@ def recency_score(dt):
 def score_item(title: str, cat: str, dt, japanese: bool, source_weight: int, source_name: str) -> int:
     t = simple_ja(title).lower()
     s = CATEGORY_WEIGHT.get(cat, 1)
-
     if japanese:
         s += 4
-
     if source_name.startswith("Yahoo") and "ブルームバーグ" in title:
         s += 3
-
     if "EIA" in source_name:
         s += 2
-
     s += source_weight
     s += recency_score(dt)
-
     for term, w in BOOST_TERMS.items():
         if term.lower() in t:
             s += w
-
     for hint in LOW_PRIORITY_HINTS:
         if hint.lower() in t:
             s -= 2
-
     return s
 
 
 # =========================================================
-# 履歴保存
+# 履歴保存（修正③：追記モードで効率化）
 # =========================================================
-def append_history(df):
+def append_history(df: pd.DataFrame):
     if df.empty:
         return
-
-    if os.path.exists(HISTORY_FILE):
-        try:
-            old_df = pd.read_csv(HISTORY_FILE)
-            combined = pd.concat([old_df, df], ignore_index=True)
+    try:
+        if HISTORY_FILE.exists():
+            existing = pd.read_csv(HISTORY_FILE)
+            combined = pd.concat([existing, df], ignore_index=True)
             combined = combined.drop_duplicates(subset=["title", "link"])
-        except Exception:
-            combined = df.copy()
-    else:
-        combined = df.copy()
+            combined.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
+        else:
+            df.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        st.warning(f"履歴保存エラー: {e}")
 
-    combined.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
+
+# =========================================================
+# 履歴読み込み（修正④：重複コードを関数化）
+# =========================================================
+def load_recent_history(days: int = 7) -> pd.DataFrame:
+    if not HISTORY_FILE.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(HISTORY_FILE)
+        if "datetime_jst" not in df.columns or df.empty:
+            return pd.DataFrame()
+        df["datetime_jst"] = pd.to_datetime(df["datetime_jst"], errors="coerce")
+        cutoff = datetime.now() - pd.Timedelta(days=days)
+        return df[df["datetime_jst"] >= cutoff].dropna(subset=["datetime_jst"])
+    except Exception as e:
+        st.warning(f"履歴読み込みエラー: {e}")
+        return pd.DataFrame()
 
 
 # =========================================================
@@ -442,6 +447,58 @@ def build_key_points(items):
 
 
 # =========================================================
+# AI概況まとめ（新機能）
+# =========================================================
+def build_ai_summary(top_items, final_unique):
+    """上位記事の見出しをもとにClaude APIで概況まとめを生成する"""
+    if not top_items:
+        return None
+
+    headlines = "\n".join(
+        f"- [{it['cat']}] {it['ja']}" for it in top_items
+    )
+    sub_headlines = "\n".join(
+        f"- [{it['cat']}] {it['ja']}" for it in final_unique[:20]
+        if it not in top_items
+    )
+    today_str = NOW_JST.strftime("%Y年%m月%d日")
+
+    prompt = f"""あなたはマクロ経済・地政学・エネルギー分野のアナリストです。
+以下は{today_str}の主要ニュース見出し一覧です。
+育休中で経済・地政学を学び直している方向けに、今日の世界情勢の「大きな流れ」を
+200〜300字の日本語で概況まとめてください。
+
+【重要ニュース】
+{headlines}
+
+【その他のニュース（参考）】
+{sub_headlines}
+
+条件：
+- 箇条書きではなく、流れのある文章で書く
+- 専門用語は使ってよいが、初学者にも伝わる表現を心がける
+- 「〜や」「〜やな」などの関西弁は使わず、標準語で書く
+- 今日だけの話でなく、背景にある構造や波及リスクにも触れる"""
+
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 1000,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        res.raise_for_status()
+        data = res.json()
+        return data["content"][0]["text"]
+    except Exception as e:
+        return f"（AI概況まとめの生成に失敗しました: {e}）"
+
+
+# =========================================================
 # 取得
 # =========================================================
 @st.cache_data(ttl=900, show_spinner=False)
@@ -515,6 +572,11 @@ enabled_source_names = st.sidebar.multiselect(
     default=[s["name"] for s in SOURCES if s["enabled"]],
 )
 
+# 修正⑤：手動更新ボタンを追加
+if st.sidebar.button("今すぐ更新（キャッシュクリア）"):
+    st.cache_data.clear()
+    st.rerun()
+
 active_sources = [s for s in SOURCES if s["name"] in enabled_source_names]
 
 
@@ -527,17 +589,28 @@ status_rows = []
 for src in active_sources:
     items, cnt, bozo, bozo_ex, status_code = load_feed(src)
     all_items.extend(items)
+
+    # 修正⑥：Bloombergなどフィード取得失敗時に警告表示
+    if cnt == 0 and not bozo_ex:
+        note = "記事0件（フィードが制限されている可能性あり）"
+    else:
+        note = str(bozo_ex) if bozo_ex else ""
+
     status_rows.append({
         "source": src["name"],
         "count": cnt,
         "http_status": status_code,
         "bozo": bozo,
-        "note": str(bozo_ex) if bozo_ex else "",
+        "note": note,
     })
 
 status_df = pd.DataFrame(status_rows)
 
 with st.expander("取得状況"):
+    # Bloombergが0件の場合に警告
+    bloomberg_row = status_df[status_df["source"].str.contains("Bloomberg")]
+    if not bloomberg_row.empty and bloomberg_row["count"].iloc[0] == 0:
+        st.warning("⚠️ Bloomberg フィードが取得できていません。認証制限の可能性があります。")
     st.dataframe(status_df, width="stretch")
 
 def in_today(it) -> bool:
@@ -573,20 +646,15 @@ def cluster_items(items, threshold=0.45):
             sim = title_similarity(item["title"], rep["title"])
             if sim >= threshold:
                 cl["items"].append(item)
-
                 if item["japanese"] and not rep["japanese"]:
                     cl["representative"] = item
                 elif item["japanese"] == rep["japanese"] and item["score"] > rep["score"]:
                     cl["representative"] = item
-
                 placed = True
                 break
 
         if not placed:
-            clusters.append({
-                "representative": item,
-                "items": [item],
-            })
+            clusters.append({"representative": item, "items": [item]})
 
     return clusters
 
@@ -683,6 +751,31 @@ key_points = build_key_points(final_unique)
 
 
 # =========================================================
+# 表示：AI概況まとめ（新機能）
+# =========================================================
+st.subheader("🤖 今日の概況まとめ（AI生成）")
+
+if not top_items:
+    st.info("記事が取得できていないため、AI概況まとめを生成できません。")
+else:
+    if "ai_summary" not in st.session_state:
+        st.session_state["ai_summary"] = None
+
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        if st.button("概況を生成"):
+            with st.spinner("AIが今日のニュースを分析中..."):
+                st.session_state["ai_summary"] = build_ai_summary(top_items, final_unique)
+
+    if st.session_state["ai_summary"]:
+        st.info(st.session_state["ai_summary"])
+    else:
+        st.caption("「概況を生成」ボタンを押すとAIが今日の世界情勢をまとめます。")
+
+st.divider()
+
+
+# =========================================================
 # 表示：今日の3行まとめ
 # =========================================================
 st.subheader("今日の3行まとめ")
@@ -749,14 +842,12 @@ watch_rows = []
 
 for topic, keywords in WATCH_TOPICS.items():
     score, matched_titles = calc_watch_topic_score(final_unique, keywords)
-
     if score >= 40:
         level = "高"
     elif score >= 18:
         level = "中"
     else:
         level = "低"
-
     watch_rows.append({
         "テーマ": topic,
         "注目度": level,
@@ -832,83 +923,44 @@ append_history(export_df)
 
 
 # =========================================================
-# 表示：過去7日ざっくり振り返り
+# 表示：過去7日ざっくり振り返り（修正④：関数化で重複解消）
 # =========================================================
 st.subheader("過去7日ざっくり振り返り")
 
-if os.path.exists(HISTORY_FILE):
-    try:
-        hist_df = pd.read_csv(HISTORY_FILE)
-
-        if "datetime_jst" in hist_df.columns and not hist_df.empty:
-            hist_df["datetime_jst"] = pd.to_datetime(hist_df["datetime_jst"], errors="coerce")
-            recent_df = hist_df.dropna(subset=["datetime_jst"]).copy()
-
-            now_naive = datetime.now().replace(microsecond=0)
-            cutoff = now_naive - pd.Timedelta(days=7)
-
-            recent_df["dt_naive"] = pd.to_datetime(recent_df["datetime_jst"], errors="coerce")
-            recent_df = recent_df[recent_df["dt_naive"] >= cutoff]
-
-            if not recent_df.empty:
-                trend_df = (
-                    recent_df.groupby("category")
-                    .size()
-                    .reset_index(name="件数")
-                    .sort_values("件数", ascending=False)
-                )
-                st.dataframe(trend_df, width="stretch")
-            else:
-                st.info("まだ過去データが少ない。何日か回したら傾向が見えてくるで。")
-        else:
-            st.info("履歴はあるけど、まだ集計できる形になってへん。")
-    except Exception as e:
-        st.warning(f"履歴集計でエラーが出た: {e}")
+recent_df = load_recent_history(days=7)
+if recent_df.empty:
+    st.info("まだ過去データが少ない。何日か回したら傾向が見えてくるで。")
 else:
-    st.info("履歴ファイルはまだ無い。何回か実行したら蓄積されるで。")
+    trend_df = (
+        recent_df.groupby("category")
+        .size()
+        .reset_index(name="件数")
+        .sort_values("件数", ascending=False)
+    )
+    st.dataframe(trend_df, width="stretch")
 
 st.divider()
 
 
 # =========================================================
-# 表示：今週よく出たテーマランキング
+# 表示：今週よく出たテーマランキング（修正④：関数化で重複解消）
 # =========================================================
 st.subheader("今週よく出たテーマランキング")
 
-if os.path.exists(HISTORY_FILE):
-    try:
-        hist_df = pd.read_csv(HISTORY_FILE)
-
-        if "datetime_jst" in hist_df.columns and not hist_df.empty:
-            hist_df["datetime_jst"] = pd.to_datetime(hist_df["datetime_jst"], errors="coerce")
-            recent_df = hist_df.dropna(subset=["datetime_jst"]).copy()
-
-            now_naive = datetime.now().replace(microsecond=0)
-            cutoff = now_naive - pd.Timedelta(days=7)
-
-            recent_df["dt_naive"] = pd.to_datetime(recent_df["datetime_jst"], errors="coerce")
-            recent_df = recent_df[recent_df["dt_naive"] >= cutoff]
-
-            if not recent_df.empty:
-                theme_rank_df = (
-                    recent_df.groupby("category")
-                    .agg(
-                        件数=("category", "size"),
-                        平均スコア=("score", "mean")
-                    )
-                    .reset_index()
-                    .sort_values(["件数", "平均スコア"], ascending=[False, False])
-                )
-                theme_rank_df["平均スコア"] = theme_rank_df["平均スコア"].round(1)
-                st.dataframe(theme_rank_df, width="stretch")
-            else:
-                st.info("まだ今週分の履歴が少ない。")
-        else:
-            st.info("履歴データがまだ十分やない。")
-    except Exception as e:
-        st.warning(f"週次ランキングでエラーが出た: {e}")
+if recent_df.empty:
+    st.info("まだ今週分の履歴が少ない。")
 else:
-    st.info("履歴ファイルがまだ無い。")
+    theme_rank_df = (
+        recent_df.groupby("category")
+        .agg(
+            件数=("category", "size"),
+            平均スコア=("score", "mean")
+        )
+        .reset_index()
+        .sort_values(["件数", "平均スコア"], ascending=[False, False])
+    )
+    theme_rank_df["平均スコア"] = theme_rank_df["平均スコア"].round(1)
+    st.dataframe(theme_rank_df, width="stretch")
 
 st.divider()
 
